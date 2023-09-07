@@ -13,6 +13,7 @@ import (
 
 	"github.com/zmap/zcrypto/tls"
 	"github.com/zmap/zgrab2"
+	"github.com/zmap/zgrab2/modules/http/defs"
 )
 
 // BEGIN Taken from handshake_server_test.go -- certs for TLS server
@@ -145,7 +146,7 @@ func (cfg *readLimitTestConfig) runFakeHTTPServer(t *testing.T) {
 // Get an HTTP scanner module with the desired config
 func (cfg *readLimitTestConfig) getScanner(t *testing.T) *Scanner {
 	var module Module
-	flags := module.NewFlags().(*Flags)
+	flags := module.NewFlags().(*defs.Flags)
 	flags.Endpoint = "/"
 	flags.Method = "GET"
 	flags.UserAgent = "Mozilla/5.0 zgrab/0.x"
@@ -288,7 +289,7 @@ func getBody(result interface{}) string {
 	if result == nil {
 		return ""
 	}
-	httpResult, ok := result.(*Results)
+	httpResult, ok := result.(*defs.Results)
 	if !ok {
 		return ""
 	}

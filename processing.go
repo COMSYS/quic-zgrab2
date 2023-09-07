@@ -10,19 +10,30 @@ import (
 	"github.com/zmap/zgrab2/lib/output"
 )
 
+// Parsed JSON input associated with a ScanTarget
+type TargetJson map[string]interface{}
+
 // Grab contains all scan responses for a single host
 type Grab struct {
 	IP     string                  `json:"ip,omitempty"`
 	Domain string                  `json:"domain,omitempty"`
 	Data   map[string]ScanResponse `json:"data,omitempty"`
+	Commit string                  `json:"commit,omitempty"`
+	Meta   string                  `json:"-"`
+	Json   TargetJson              `json:"-"`
+	Ptr    []string                `json:"ptr,omitempty"`
 }
 
 // ScanTarget is the host that will be scanned
 type ScanTarget struct {
-	IP     net.IP
-	Domain string
-	Tag    string
-	Port   *uint
+	IP      net.IP
+	network string
+	Domain  string
+	Tag     string
+	Port    *uint
+	Meta    string
+	Json    TargetJson
+	Ptr     []string
 }
 
 func (target ScanTarget) String() string {
@@ -53,6 +64,19 @@ func (target *ScanTarget) Host() string {
 	}
 	log.Fatalf("Bad target %s: no IP/Domain", target.String())
 	panic("unreachable")
+}
+
+func (target *ScanTarget) IPNetwork() string {
+	// Explicit network name takes precedence
+	if len(target.network) > 0 {
+		return target.network
+	}
+	if target.IP == nil {
+		return "ip"
+	} else if target.IP.To4() != nil {
+		return "ip4"
+	}
+	return "ip6"
 }
 
 // Open connects to the ScanTarget using the configured flags, and returns a net.Conn that uses the configured timeouts for Read/Write operations.
@@ -125,11 +149,17 @@ func BuildGrabFromInputResponse(t *ScanTarget, responses map[string]ScanResponse
 		IP:     ipstr,
 		Domain: t.Domain,
 		Data:   responses,
+		Meta:   t.Meta,
+		Json:   t.Json,
+		Ptr:    t.Ptr,
 	}
 }
 
+var Commithash string
+
 // EncodeGrab serializes a Grab to JSON, handling the debug fields if necessary.
 func EncodeGrab(raw *Grab, includeDebug bool) ([]byte, error) {
+	raw.Commit = Commithash
 	var outputData interface{}
 	if includeDebug {
 		outputData = raw
@@ -145,7 +175,16 @@ func EncodeGrab(raw *Grab, includeDebug bool) ([]byte, error) {
 		}
 		outputData = stripped
 	}
-	return json.Marshal(outputData)
+	if raw.Json != nil {
+		raw.Json["zgrab"] = outputData
+		outputData = raw.Json
+	}
+	if len(raw.Meta) > 0 {
+		b, err := json.Marshal(outputData)
+		return []byte(raw.Meta + "|" + string(b)), err
+	} else {
+		return json.Marshal(outputData)
+	}
 }
 
 // grabTarget calls handler for each action
@@ -175,10 +214,17 @@ func grabTarget(input ScanTarget, m *Monitor) []byte {
 		}
 	}
 
+	if config.LookupRDNS {
+		ptr, err := net.LookupAddr(input.IP.String())
+		if err == nil {
+			input.Ptr = ptr
+		}
+	}
+
 	raw := BuildGrabFromInputResponse(&input, moduleResult)
 	result, err := EncodeGrab(raw, includeDebugOutput())
 	if err != nil {
-		log.Fatalf("unable to marshal data: %s", err)
+		log.Fatalf("unable to marshal data: %s, %#v", err, raw)
 	}
 
 	return result

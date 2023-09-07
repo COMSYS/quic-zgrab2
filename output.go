@@ -153,6 +153,7 @@ func OutputResults(w *bufio.Writer, results <-chan []byte) error {
 		if err := w.WriteByte('\n'); err != nil {
 			return err
 		}
+		w.Flush()
 	}
 	return nil
 }

@@ -211,14 +211,14 @@ func (t *Transport) onceSetNextProtoDefaults() {
 		// Transport.
 		return
 	}
-	if t.TLSClientConfig != nil || t.Dial != nil || t.DialTLS != nil {
-		// Be conservative and don't automatically enable
-		// http2 if they've specified a custom TLS config or
-		// custom dialers. Let them opt-in themselves via
-		// http2.ConfigureTransport so we don't surprise them
-		// by modifying their tls.Config. Issue 14275.
-		return
-	}
+	//if t.TLSClientConfig != nil || t.Dial != nil || t.DialTLS != nil {
+	// Be conservative and don't automatically enable
+	// http2 if they've specified a custom TLS config or
+	// custom dialers. Let them opt-in themselves via
+	// http2.ConfigureTransport so we don't surprise them
+	// by modifying their tls.Config. Issue 14275.
+	//	return
+	//}
 	t2, err := http2configureTransport(t)
 	if err != nil {
 		log.Printf("Error enabling Transport HTTP/2 support: %v", err)
@@ -1015,6 +1015,10 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 			}
 			pconn.tlsState = &cs
 		}
+		if tc, ok := pconn.conn.(*zgrab2.TLSConnection); ok {
+			cs := tc.ConnectionState()
+			pconn.tlsState = &cs
+		}
 	} else {
 		conn, err := t.dial(ctx, "tcp", cm.addr())
 		if err != nil {
@@ -1119,7 +1123,11 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (*persistCon
 
 	if s := pconn.tlsState; s != nil && s.NegotiatedProtocolIsMutual && s.NegotiatedProtocol != "" {
 		if next, ok := t.TLSNextProto[s.NegotiatedProtocol]; ok {
-			return &persistConn{alt: next(cm.targetAddr, pconn.conn.(*tls.Conn))}, nil
+			if tc, ok := pconn.conn.(*zgrab2.TLSConnection); ok {
+				return &persistConn{conn: pconn.conn, alt: next(cm.targetAddr, &tc.Conn)}, nil
+			} else if tc, ok := pconn.conn.(*tls.Conn); ok {
+				return &persistConn{conn: pconn.conn, alt: next(cm.targetAddr, tc)}, nil
+			}
 		}
 	}
 
@@ -1212,7 +1220,6 @@ func useProxy(addr string) bool {
 // http://proxy.com|http           http to proxy, http to anywhere after that
 //
 // Note: no support to https to the proxy yet.
-//
 type connectMethod struct {
 	proxyURL     *url.URL // nil for no proxy, else full proxy URL
 	targetScheme string   // "http" or "https"

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -15,6 +16,7 @@ import (
 type Config struct {
 	OutputFileName     string          `short:"o" long:"output-file" default:"-" description:"Output filename, use - for stdout"`
 	InputFileName      string          `short:"f" long:"input-file" default:"-" description:"Input filename, use - for stdin"`
+	InputFormat        string          `long:"input-format" default:"zdns" description:"Input line format (CSV or ZDNS)"`
 	MetaFileName       string          `short:"m" long:"metadata-file" default:"-" description:"Metadata filename, use - for stderr"`
 	LogFileName        string          `short:"l" long:"log-file" default:"-" description:"Log filename, use - for stderr"`
 	LocalAddress       string          `long:"source-ip" description:"Local source IP address to use for making connections"`
@@ -32,6 +34,7 @@ type Config struct {
 	inputTargets       InputTargetsFunc
 	outputResults      OutputResultsFunc
 	localAddr          *net.TCPAddr
+	LookupRDNS         bool `short:"r" long:"rdns" description:"Lookup PTR record for each host"`
 }
 
 // SetInputFunc sets the target input function to the provided function.
@@ -51,6 +54,9 @@ func init() {
 
 var config Config
 
+// Expose private config for modules
+var CurrentConfig = &config
+
 func validateFrameworkConfiguration() {
 	// validate files
 	if config.LogFileName == "-" {
@@ -62,7 +68,15 @@ func validateFrameworkConfiguration() {
 		}
 		log.SetOutput(config.logFile)
 	}
-	SetInputFunc(InputTargetsCSV)
+
+	switch strings.ToLower(config.InputFormat) {
+	case "csv":
+		SetInputFunc(InputTargetsCSV)
+	case "zdns":
+		SetInputFunc(InputTargetsZDNS)
+	default:
+		log.Fatalf("Invalid input format %v, must be CSV or ZDNS", config.InputFormat)
+	}
 
 	if config.LocalAddress != "" {
 		parsed := net.ParseIP(config.LocalAddress)

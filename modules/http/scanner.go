@@ -18,12 +18,18 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zmap/zcrypto/tls"
 	"github.com/zmap/zgrab2"
 	"github.com/zmap/zgrab2/lib/http"
+	"github.com/zmap/zgrab2/modules/http/blocklist"
+	"github.com/zmap/zgrab2/modules/http/defs"
+	"github.com/zmap/zgrab2/modules/http/h3"
+	"github.com/zmap/zgrab2/modules/http/tcpinfo"
 	"golang.org/x/net/html/charset"
 )
 
@@ -35,54 +41,11 @@ var (
 	// ErrTooManyRedirects is returned when the number of HTTP redirects exceeds
 	// MaxRedirects.
 	ErrTooManyRedirects = errors.New("Too many redirects")
+
+	// ErrRedirectWithCreds is returned when an HTTP redirect location contains
+	// basic auth credentials.
+	ErrRedirectWithCreds = errors.New("redirect contains credentials")
 )
-
-// Flags holds the command-line configuration for the HTTP scan module.
-// Populated by the framework.
-//
-// TODO: Custom headers?
-type Flags struct {
-	zgrab2.BaseFlags
-	zgrab2.TLSFlags
-	Method          string `long:"method" default:"GET" description:"Set HTTP request method type"`
-	Endpoint        string `long:"endpoint" default:"/" description:"Send an HTTP request to an endpoint"`
-	FailHTTPToHTTPS bool   `long:"fail-http-to-https" description:"Trigger retry-https logic on known HTTP/400 protocol mismatch responses"`
-	UserAgent       string `long:"user-agent" default:"Mozilla/5.0 zgrab/0.x" description:"Set a custom user agent"`
-	RetryHTTPS      bool   `long:"retry-https" description:"If the initial request fails, reconnect and try with HTTPS."`
-	MaxSize         int    `long:"max-size" default:"256" description:"Max kilobytes to read in response to an HTTP request"`
-	MaxRedirects    int    `long:"max-redirects" default:"0" description:"Max number of redirects to follow"`
-
-	// FollowLocalhostRedirects overrides the default behavior to return
-	// ErrRedirLocalhost whenever a redirect points to localhost.
-	FollowLocalhostRedirects bool `long:"follow-localhost-redirects" description:"Follow HTTP redirects to localhost"`
-
-	// UseHTTPS causes the first request to be over TLS, without requiring a
-	// redirect to HTTPS. It does not change the port used for the connection.
-	UseHTTPS bool `long:"use-https" description:"Perform an HTTPS connection on the initial host"`
-
-	// RedirectsSucceed causes the ErrTooManRedirects error to be suppressed
-	RedirectsSucceed bool `long:"redirects-succeed" description:"Redirects are always a success, even if max-redirects is exceeded"`
-
-	OverrideSH bool `long:"override-sig-hash" description:"Override the default SignatureAndHashes TLS option with more expansive default"`
-
-	// ComputeDecodedBodyHashAlgorithm enables computing the body hash later than the default,
-	// using the specified algorithm, allowing a user of the response to recompute a matching hash
-	ComputeDecodedBodyHashAlgorithm string `long:"compute-decoded-body-hash-algorithm" choice:"sha256" choice:"sha1" description:"Choose algorithm for BodyHash field"`
-
-	// WithBodyLength enables adding the body_size field to the Response
-	WithBodyLength bool `long:"with-body-size" description:"Enable the body_size attribute, for how many bytes actually read"`
-}
-
-// A Results object is returned by the HTTP module's Scanner.Scan()
-// implementation.
-type Results struct {
-	// Result is the final HTTP response in the RedirectResponseChain
-	Response *http.Response `json:"response,omitempty"`
-
-	// RedirectResponseChain is non-empty is the scanner follows a redirect.
-	// It contains all redirect response prior to the final response.
-	RedirectResponseChain []*http.Response `json:"redirect_response_chain,omitempty"`
-}
 
 // Module is an implementation of the zgrab2.Module interface.
 type Module struct {
@@ -90,26 +53,28 @@ type Module struct {
 
 // Scanner is the implementation of the zgrab2.Scanner interface.
 type Scanner struct {
-	config        *Flags
+	config        *defs.Flags
+	tcpisvc       *tcpinfo.TCPInfoService
 	decodedHashFn func([]byte) string
 }
 
 // scan holds the state for a single scan. This may entail multiple connections.
 // It is used to implement the zgrab2.Scanner interface.
 type scan struct {
-	connections    []net.Conn
+	connections    []*tcpinfo.ConnWrapper
 	scanner        *Scanner
 	target         *zgrab2.ScanTarget
 	transport      *http.Transport
 	client         *http.Client
-	results        Results
+	mu             sync.Mutex // guards results where necessary
+	results        defs.Results
 	url            string
 	globalDeadline time.Time
 }
 
 // NewFlags returns an empty Flags object.
 func (module *Module) NewFlags() interface{} {
-	return new(Flags)
+	return new(defs.Flags)
 }
 
 // NewScanner returns a new instance Scanner instance.
@@ -122,16 +87,6 @@ func (module *Module) Description() string {
 	return "Send an HTTP request and read the response, optionally following redirects."
 }
 
-// Validate performs any needed validation on the arguments
-func (flags *Flags) Validate(args []string) error {
-	return nil
-}
-
-// Help returns module-specific help
-func (flags *Flags) Help() string {
-	return ""
-}
-
 // Protocol returns the protocol identifer for the scanner.
 func (scanner *Scanner) Protocol() string {
 	return "http"
@@ -139,8 +94,23 @@ func (scanner *Scanner) Protocol() string {
 
 // Init initializes the scanner with the given flags
 func (scanner *Scanner) Init(flags zgrab2.ScanFlags) error {
-	fl, _ := flags.(*Flags)
+	fl, _ := flags.(*defs.Flags)
 	scanner.config = fl
+
+	blocklist.Init()
+
+	max_socks := uint64(0) // disables BPF features
+	if !fl.DisableBPF {
+		// Maximum open TCP sockets: (1 + redirects) per sender
+		max_socks = 1 + uint64(fl.MaxRedirects)
+		max_socks *= uint64(zgrab2.CurrentConfig.Senders)
+		max_socks = (max_socks * 11) / 10 // 10% headroom for uneven hash distribution
+	}
+
+	var err error
+	if scanner.tcpisvc, err = tcpinfo.NewTCPInfoService(uint32(max_socks)); err != nil {
+		log.Fatalf("Unable to initialize TCPInfoService: %v\nFor BPF-related errors, you can disable the feature with --disable-bpf", err)
+	}
 
 	if fl.ComputeDecodedBodyHashAlgorithm == "sha1" {
 		scanner.decodedHashFn = func(body []byte) string {
@@ -229,13 +199,47 @@ func (scan *scan) dialContext(ctx context.Context, network string, addr string) 
 	}
 
 	timeoutContext, _ := context.WithTimeout(context.Background(), scan.scanner.config.Timeout)
+	deadlineContext := scan.withDeadlineContext(timeoutContext)
 
-	conn, err := dialer.DialContext(scan.withDeadlineContext(timeoutContext), network, addr)
+	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	scan.connections = append(scan.connections, conn)
-	return conn, nil
+
+	targets, err := blocklist.LookupIP(dialer.Dialer.Resolver, deadlineContext, scan.target.IPNetwork(), host)
+	if err != nil {
+		return nil, err
+	}
+
+	resolver, err := zgrab2.NewMultiFakeResolver(targets)
+	if err != nil {
+		return nil, err
+	}
+	dialer.Dialer.Resolver = resolver
+
+	conn, err := dialer.DialContext(deadlineContext, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	var ip string
+	switch addr := conn.RemoteAddr().(type) {
+	case *net.UDPAddr:
+		ip = addr.IP.String()
+	case *net.TCPAddr:
+		ip = addr.IP.String()
+	}
+	var target_ips []string
+	for _, target := range targets {
+		target_ips = append(target_ips, target.String())
+	}
+	scan.results.DialedAddrs = append(scan.results.DialedAddrs, defs.AddrDomain{IP: ip, Targets: target_ips, Host: host})
+
+	wConn, err := scan.scanner.tcpisvc.WrapConn(conn)
+	if err != nil {
+		return nil, err
+	}
+	scan.connections = append(scan.connections, wConn)
+	return wConn, nil
 }
 
 // getTLSDialer returns a Dial function that connects using the
@@ -291,7 +295,7 @@ func (scan *scan) getTLSDialer(t *zgrab2.ScanTarget) func(network, addr string) 
 // Taken from zgrab/zlib/grabber.go -- check if the URL points to localhost
 func redirectsToLocalhost(host string) bool {
 	if i := net.ParseIP(host); i != nil {
-		return i.IsLoopback() || i.Equal(net.IPv4zero)
+		return i.IsLoopback() || i.IsUnspecified()
 	}
 	if host == "localhost" {
 		return true
@@ -300,7 +304,7 @@ func redirectsToLocalhost(host string) bool {
 	if addrs, err := net.LookupHost(host); err == nil {
 		for _, i := range addrs {
 			if ip := net.ParseIP(i); ip != nil {
-				if ip.IsLoopback() || ip.Equal(net.IPv4zero) {
+				if ip.IsLoopback() || ip.IsUnspecified() {
 					return true
 				}
 			}
@@ -313,9 +317,9 @@ func redirectsToLocalhost(host string) bool {
 // the redirectToLocalhost and MaxRedirects config
 func (scan *scan) getCheckRedirect() func(*http.Request, *http.Response, []*http.Request) error {
 	return func(req *http.Request, res *http.Response, via []*http.Request) error {
-		if !scan.scanner.config.FollowLocalhostRedirects && redirectsToLocalhost(req.URL.Hostname()) {
+		/*if !scan.scanner.config.FollowLocalhostRedirects && redirectsToLocalhost(req.URL.Hostname()) {
 			return ErrRedirLocalhost
-		}
+		}*/
 		scan.results.RedirectResponseChain = append(scan.results.RedirectResponseChain, res)
 		b := new(bytes.Buffer)
 		maxReadLen := int64(scan.scanner.config.MaxSize) * 1024
@@ -340,6 +344,10 @@ func (scan *scan) getCheckRedirect() func(*http.Request, *http.Response, []*http
 
 		if len(via) > scan.scanner.config.MaxRedirects {
 			return ErrTooManyRedirects
+		}
+
+		if req.URL.User != nil {
+			return ErrRedirectWithCreds
 		}
 
 		return nil
@@ -423,6 +431,15 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 		defer resp.Body.Close()
 	}
 	scan.results.Response = resp
+	for _, c := range scan.connections {
+		info, err := c.GetTCPInfo()
+		if err != nil {
+			log.Errorf("http/scanner.go Grab: failed to retrieve TCPInfo: %v", err)
+			// Add nil to list to keep in sync with DialedAddrs
+		}
+		scan.results.ConnInfos = append(scan.results.ConnInfos, info)
+	}
+
 	if err != nil {
 		if urlError, ok := err.(*url.Error); ok {
 			err = urlError.Err
@@ -521,22 +538,19 @@ func (scan *scan) Grab() *zgrab2.ScanError {
 // multiple TCP connections to hosts other than target.
 func (scanner *Scanner) Scan(t zgrab2.ScanTarget) (zgrab2.ScanStatus, interface{}, error) {
 	scan := scanner.newHTTPScan(&t, scanner.config.UseHTTPS)
-	defer scan.Cleanup()
 	err := scan.Grab()
-	if err != nil {
-		if scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
-			scan.Cleanup()
-			retry := scanner.newHTTPScan(&t, true)
-			defer retry.Cleanup()
-			retryError := retry.Grab()
-			if retryError != nil {
-				return retryError.Unpack(&retry.results)
-			}
-			return zgrab2.SCAN_SUCCESS, &retry.results, nil
-		}
-		return err.Unpack(&scan.results)
+	if err != nil && scanner.config.RetryHTTPS && !scanner.config.UseHTTPS {
+		scan.Cleanup()
+		scan = scanner.newHTTPScan(&t, true)
+		err = scan.Grab()
 	}
-	return zgrab2.SCAN_SUCCESS, &scan.results, nil
+	defer scan.Cleanup()
+
+	res := h3.TryGrab(&t, scanner.config, scan.url, &scan.results)
+	if err != nil {
+		return err.Unpack(res)
+	}
+	return zgrab2.SCAN_SUCCESS, res, nil
 }
 
 // RegisterModule is called by modules/http.go to register this module with the

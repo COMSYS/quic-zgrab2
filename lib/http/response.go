@@ -114,6 +114,8 @@ type Response struct {
 	// The pointer is shared between responses and should not be
 	// modified.
 	TLS *tls.ConnectionState `json:"-"`
+
+	Addr string `json:"addr"`
 }
 
 // Hex returns the given fingerprint encoded as a hex string.
